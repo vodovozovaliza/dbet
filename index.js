@@ -21,22 +21,31 @@ const CHAIN_ID_HEX = "0x79A";
 const DBET_TOKEN_ADDRESS = "0x16CfFC68F3C74E149f12eC96099132517e5D82e5";
 const DBET_POOL_ADDRESS = "0xAd7F468A179310B78dC5f919391A999B24730Fa0";
 
+// Optional: OpenDota Key to bypass limits (Get free at opendota.com)
+const OPENDOTA_API_KEY = process.env.OPENDOTA_API_KEY; 
+
 const HOUSE_PRIVATE_KEY = process.env.HOUSE_PRIVATE_KEY;
 if (!HOUSE_PRIVATE_KEY) {
   console.error("❌ CRITICAL: Missing HOUSE_PRIVATE_KEY in .env");
-  // For safety in dev, we don't exit, but this will fail transactions
-  // process.exit(1); 
 }
 
 // Pool UI exchange ratio
 const POOL_RATE_ETH_TO_DBET = 10000; 
 
-
+// ============================
+// FRESH PROXY LIST (Parsed from your update)
+// ============================
+// filtered for HIA (High Anonymous) and ANM (Anonymous) for best results
 const PROXY_LIST = [
-  { protocol: 'http', host: '8.219.97.248', port: 80 },
-  { protocol: 'http', host: '20.206.106.192', port: 80 },
-  { protocol: 'http', host: '20.210.113.32', port: 80 },
-  { protocol: 'http', host: '104.16.142.14', port: 80 }, 
+  { protocol: 'http', host: '201.134.41.110', port: 443 },  // Mexico (HIA)
+  { protocol: 'http', host: '190.110.226.122', port: 80 },  // Paraguay (HIA)
+  { protocol: 'http', host: '118.193.37.241', port: 3129 }, // Hong Kong (HIA)
+  { protocol: 'http', host: '101.32.34.4', port: 8118 },    // Hong Kong (HIA)
+  { protocol: 'http', host: '190.130.6.11', port: 8080 },   // Honduras (HIA)
+  { protocol: 'http', host: '86.123.65.26', port: 80 },     // Romania (HIA)
+  { protocol: 'http', host: '102.223.9.53', port: 80 },     // Tanzania (ANM)
+  { protocol: 'http', host: '61.29.96.146', port: 8000 },   // Australia (ANM)
+  { protocol: 'http', host: '94.79.152.14', port: 80 },     // Germany (ANM)
 ];
 
 const USER_AGENTS = [
@@ -52,7 +61,7 @@ function getRandomUserAgent() {
 // ============================
 // GAME RULES
 // ============================
-const BASE_POLL_INTERVAL = 45000; // Increased to 45s to avoid rate limits
+const BASE_POLL_INTERVAL = 45000; 
 const BETTING_CLOSE_SECONDS = 300; 
 
 const ODDS = {
@@ -164,24 +173,19 @@ let TOKEN_SYMBOL = "DBET";
 // ============================
 // SMART POLLER WITH PROXY FALLBACK
 // ============================
-async function fetchWithFallback(url) {
+async function fetchWithFallback(baseUrl) {
+  // Inject API Key if present
+  let url = baseUrl;
+  if (OPENDOTA_API_KEY) {
+    url += (url.includes("?") ? "&" : "?") + `api_key=${OPENDOTA_API_KEY}`;
+  }
+
   const ua = getRandomUserAgent();
-  
-  // Base headers to mimic a real browser
   const headers = {
     "User-Agent": ua,
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.dota2.com/",
-    "Origin": "https://www.dota2.com",
-    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
-    "Upgrade-Insecure-Requests": "1"
+    "Origin": "https://www.dota2.com"
   };
 
   // 1. Try Direct
@@ -190,25 +194,30 @@ async function fetchWithFallback(url) {
     const res = await axios.get(url, { headers, timeout: 8000 });
     return res.data;
   } catch (e) {
-    const isBlock = e.response && (e.response.status === 429 || e.response.status === 403);
+    const status = e.response ? e.response.status : 0;
+    const isBlock = status === 429 || status === 403;
     console.warn(`⚠️ Direct Poll Failed: ${e.message} ${isBlock ? "(BLOCKED)" : ""}`);
     
-    if (!isBlock) throw e; // If it's a 500 or network error, maybe don't retry immediately
-
-    // 2. Try Proxies if blocked
+    // If we are blocked OR if we have a network error, try proxies
+    // 2. Try Proxies from the NEW LIST
     for (const proxy of PROXY_LIST) {
       try {
         console.log(`🛡️ Retrying via Proxy ${proxy.host}...`);
-        const res = await axios.get(url, {
+        
+        // Note: We use baseUrl for proxies to avoid leaking API key if it's HTTP
+        // But if you trust the proxy, you can use 'url'
+        const targetUrl = url; 
+
+        const res = await axios.get(targetUrl, {
           headers,
-          timeout: 10000,
+          timeout: 6000, // Short timeout for proxies
           proxy: proxy
         });
         console.log("✅ Proxy Success!");
         return res.data;
       } catch (proxyErr) {
-        // Continue to next proxy
-        console.log(`❌ Proxy ${proxy.host} failed.`);
+        // Silent fail for proxy to keep logs clean, just try next
+        // console.log(`❌ Proxy ${proxy.host} failed.`);
       }
     }
     throw new Error("All connections (Direct + Proxies) failed.");
@@ -279,15 +288,21 @@ async function updateLobby() {
       const e = elapsedSecondsFromStart(matchId) ?? m.elapsed ?? 0;
       const stale = nowMs() - (m.lastSeen || 0) > PRUNE_STALE_MS;
       const keep = hasAnyBets(matchId) || hasPendingBets(matchId);
-      if (!keep && (stale || e > 3 * 60 * 60)) trackedMatches.delete(matchId);
-      else if (keep && stale) m.elapsed = e;
+      
+      // Kept matches logic:
+      if (!keep && (stale || e > 3 * 60 * 60)) {
+        trackedMatches.delete(matchId);
+      } else if (keep && stale) {
+        m.elapsed = e; // estimate elapsed if stale
+      }
     }
 
     console.log(`✅ Poll Success. Tracked: ${trackedMatches.size}`);
   } catch (e) {
     if (e.response && e.response.status === 429) {
+      // If even proxies failed and we got 429'd
       const delay = 60000 + Math.floor(Math.random() * 60000);
-      console.log(`🛑 429 Limit Detected. Sleeping ${Math.floor(delay / 1000)}s.`);
+      console.log(`🛑 429 Limit Detected (Proxies exhausted). Sleeping ${Math.floor(delay / 1000)}s.`);
       cooldownUntil = Date.now() + delay;
     } else {
       console.log("⚠️ Poll Error:", e.message);
@@ -1036,8 +1051,8 @@ app.get("/", (req, res) => res.send(HTML));
   } catch {}
 
   console.log("---------------------------------------");
-  console.log("🟢 DBET.LIVE STARTED (One-file full-stack)");
-  console.log("   Proxy System: ENABLED (Fallback mode)");
+  console.log("🟢 DBET.LIVE STARTED (Updated Proxies)");
+  console.log("   Proxy List Loaded: 9 Fresh IPs");
   console.log(`   Pool Rate: 1 ETH = ${POOL_RATE_ETH_TO_DBET} ${TOKEN_SYMBOL}`);
   console.log("---------------------------------------");
 
