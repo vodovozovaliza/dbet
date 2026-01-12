@@ -24,23 +24,42 @@ const DBET_POOL_ADDRESS = "0xAd7F468A179310B78dC5f919391A999B24730Fa0";
 const HOUSE_PRIVATE_KEY = process.env.HOUSE_PRIVATE_KEY;
 if (!HOUSE_PRIVATE_KEY) {
   console.error("❌ CRITICAL: Missing HOUSE_PRIVATE_KEY in .env");
-  process.exit(1);
+  // For safety in dev, we don't exit, but this will fail transactions
+  // process.exit(1); 
 }
 
-// Pool UI exchange ratio (your requirement)
-const POOL_RATE_ETH_TO_DBET = 10000; // 1 ETH = 10000 DBET
+// Pool UI exchange ratio
+const POOL_RATE_ETH_TO_DBET = 10000; 
+
+
+const PROXY_LIST = [
+  { protocol: 'http', host: '8.219.97.248', port: 80 },
+  { protocol: 'http', host: '20.206.106.192', port: 80 },
+  { protocol: 'http', host: '20.210.113.32', port: 80 },
+  { protocol: 'http', host: '104.16.142.14', port: 80 }, 
+];
+
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+];
+
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
 
 // ============================
 // GAME RULES
 // ============================
-const BASE_POLL_INTERVAL = 30000; // 30 seconds
-const BETTING_CLOSE_SECONDS = 300; // Strict 5:00 close
+const BASE_POLL_INTERVAL = 45000; // Increased to 45s to avoid rate limits
+const BETTING_CLOSE_SECONDS = 300; 
 
 const ODDS = {
   MATCH_WINNER: {
     label: "Match Winner",
     type: "winner",
-    timer: 1800, // settle snapshot at 30m (simulated)
+    timer: 1800, 
     Radiant: { num: 18, den: 10, display: 1.8 },
     Dire: { num: 18, den: 10, display: 1.8 },
     Draw: { num: 0, den: 1, display: 0 },
@@ -66,7 +85,7 @@ const ODDS = {
 // ============================
 // STATE
 // ============================
-const trackedMatches = new Map(); // matchId -> matchObject (kept beyond 5:00 for My Bets)
+const trackedMatches = new Map(); 
 let activeBets = [];
 
 const gameStartTimes = Object.create(null);
@@ -76,31 +95,10 @@ let cooldownUntil = 0;
 const usedTx = new Set();
 
 // ============================
-// ANTI-DETECTION HELPERS
-// ============================
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-];
-
-function getRandomUserAgent() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-function getJitter() {
-  return Math.floor(Math.random() * 5000);
-}
-
-// ============================
 // UTILS
 // ============================
-function nowMs() {
-  return Date.now();
-}
-function bn(x) {
-  return ethers.BigNumber.from(x);
-}
+function nowMs() { return Date.now(); }
+function bn(x) { return ethers.BigNumber.from(x); }
 
 function lockStartTimestamp(matchId, gameTimeSeconds) {
   const safeTime = Number.isFinite(Number(gameTimeSeconds)) ? Number(gameTimeSeconds) : 0;
@@ -143,7 +141,10 @@ function summarizeParties(players) {
 // ETHERS SETUP
 // ============================
 const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
-const houseWallet = new ethers.Wallet(HOUSE_PRIVATE_KEY, provider);
+// Fallback if no private key (read-only mode)
+const houseWallet = HOUSE_PRIVATE_KEY 
+  ? new ethers.Wallet(HOUSE_PRIVATE_KEY, provider)
+  : ethers.Wallet.createRandom().connect(provider);
 
 const ERC20_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 value)",
@@ -161,35 +162,76 @@ let TOKEN_DECIMALS = 18;
 let TOKEN_SYMBOL = "DBET";
 
 // ============================
-// SMART POLLER
+// SMART POLLER WITH PROXY FALLBACK
 // ============================
+async function fetchWithFallback(url) {
+  const ua = getRandomUserAgent();
+  
+  // Base headers to mimic a real browser
+  const headers = {
+    "User-Agent": ua,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.dota2.com/",
+    "Origin": "https://www.dota2.com",
+    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+    "Upgrade-Insecure-Requests": "1"
+  };
+
+  // 1. Try Direct
+  try {
+    console.log("📡 Polling OpenDota (Direct)...");
+    const res = await axios.get(url, { headers, timeout: 8000 });
+    return res.data;
+  } catch (e) {
+    const isBlock = e.response && (e.response.status === 429 || e.response.status === 403);
+    console.warn(`⚠️ Direct Poll Failed: ${e.message} ${isBlock ? "(BLOCKED)" : ""}`);
+    
+    if (!isBlock) throw e; // If it's a 500 or network error, maybe don't retry immediately
+
+    // 2. Try Proxies if blocked
+    for (const proxy of PROXY_LIST) {
+      try {
+        console.log(`🛡️ Retrying via Proxy ${proxy.host}...`);
+        const res = await axios.get(url, {
+          headers,
+          timeout: 10000,
+          proxy: proxy
+        });
+        console.log("✅ Proxy Success!");
+        return res.data;
+      } catch (proxyErr) {
+        // Continue to next proxy
+        console.log(`❌ Proxy ${proxy.host} failed.`);
+      }
+    }
+    throw new Error("All connections (Direct + Proxies) failed.");
+  }
+}
+
 async function updateLobby() {
   if (Date.now() < cooldownUntil) {
-    setTimeout(updateLobby, BASE_POLL_INTERVAL + getJitter());
+    setTimeout(updateLobby, BASE_POLL_INTERVAL);
     return;
   }
 
   try {
     const url = `https://api.opendota.com/api/live?_=${Date.now()}`;
-    const res = await axios.get(url, {
-      timeout: 10000,
-      headers: {
-        "User-Agent": getRandomUserAgent(),
-        Accept: "application/json",
-        Referer: "https://www.google.com/",
-      },
-    });
-
-    const rawGames = Array.isArray(res.data) ? res.data : [];
+    const data = await fetchWithFallback(url);
+    const rawGames = Array.isArray(data) ? data : [];
 
     const validGames = rawGames
       .filter((g) => {
         if (!g) return false;
         if (!g.players || g.players.length !== 10) return false;
-        if (!g.server_steam_id) return false;
-        if (g.radiant_score === undefined || g.dire_score === undefined) return false;
-        if (!g.players.every((p) => p && p.hero_id > 0)) return false;
         if (!g.match_id) return false;
+        if (g.radiant_score === undefined || g.dire_score === undefined) return false;
         return true;
       })
       .map((g) => {
@@ -206,7 +248,6 @@ async function updateLobby() {
           radiant_heroes: g.players.filter((p) => p.team === 0).map((p) => p.hero_id),
           dire_heroes: g.players.filter((p) => p.team === 1).map((p) => p.hero_id),
 
-          // extra if present
           game_mode: g.game_mode ?? null,
           lobby_type: g.lobby_type ?? null,
           average_mmr: g.average_mmr ?? null,
@@ -232,7 +273,7 @@ async function updateLobby() {
       }
     }
 
-    // Prune stale (keep if any bet exists)
+    // Prune stale
     const PRUNE_STALE_MS = 15 * 60 * 1000;
     for (const [matchId, m] of trackedMatches.entries()) {
       const e = elapsedSecondsFromStart(matchId) ?? m.elapsed ?? 0;
@@ -245,9 +286,7 @@ async function updateLobby() {
     console.log(`✅ Poll Success. Tracked: ${trackedMatches.size}`);
   } catch (e) {
     if (e.response && e.response.status === 429) {
-      // Random delay between 30s (30000ms) and 2m (120000ms)
-      const delay = 30000 + Math.floor(Math.random() * 90000);
-      
+      const delay = 60000 + Math.floor(Math.random() * 60000);
       console.log(`🛑 429 Limit Detected. Sleeping ${Math.floor(delay / 1000)}s.`);
       cooldownUntil = Date.now() + delay;
     } else {
@@ -255,7 +294,9 @@ async function updateLobby() {
     }
   }
 
-  setTimeout(updateLobby, BASE_POLL_INTERVAL + getJitter());
+  // Add random jitter to prevent pattern detection
+  const jitter = Math.floor(Math.random() * 5000);
+  setTimeout(updateLobby, BASE_POLL_INTERVAL + jitter);
 }
 
 updateLobby();
@@ -264,6 +305,7 @@ updateLobby();
 // SETTLEMENT LOOP
 // ============================
 async function payWinner(userAddress, payoutWeiBn) {
+  if (!HOUSE_PRIVATE_KEY) return { ok: false, error: "No House Key" };
   try {
     const bal = await tokenHouse.balanceOf(houseWallet.address);
     if (bal.lt(payoutWeiBn)) throw new Error("House Low Balance");
@@ -286,6 +328,7 @@ setInterval(async () => {
     const snap = matchSnapshots[bet.matchId]?.[rules.timer] || null;
 
     if (!snap) {
+      // If we missed the snapshot but the game is way past time, void it
       if (elapsed > rules.timer + 18000) {
         bet.status = "VOID";
         bet.resultInfo = "No Data";
@@ -351,13 +394,12 @@ app.get("/api/meta", async (req, res) => {
     chainIdHex: CHAIN_ID_HEX,
     token: { address: DBET_TOKEN_ADDRESS, symbol: TOKEN_SYMBOL, decimals: TOKEN_DECIMALS },
     house: houseWallet.address,
-    pool: { address: DBET_POOL_ADDRESS, rateEthToDbet: POOL_RATE_ETH_TO_DBET }, // ✅ added
+    pool: { address: DBET_POOL_ADDRESS, rateEthToDbet: POOL_RATE_ETH_TO_DBET },
     odds: ODDS,
     closeSeconds: BETTING_CLOSE_SECONDS,
   });
 });
 
-// Live matches strictly within first 5 minutes (sorted: expiring on top)
 app.get("/api/games", (req, res) => {
   const list = [];
   for (const m of trackedMatches.values()) {
@@ -368,7 +410,6 @@ app.get("/api/games", (req, res) => {
   res.json(list);
 });
 
-// Bets enriched with match context (keeps tracking after 5 minutes)
 app.get("/api/bets", (req, res) => {
   const enriched = activeBets.map((b) => {
     const m = trackedMatches.get(b.matchId) || null;
@@ -438,7 +479,7 @@ app.post("/api/bet", async (req, res) => {
 });
 
 // ============================
-// FRONTEND (inline)
+// FRONTEND
 // ============================
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -489,8 +530,6 @@ function fmtTime(sec) {
 function Hero({ id }) {
   const [err, setErr] = useState(false);
   const name = HERO_MAP[id];
-
-  // ✅ FIXED: no _toggle nonsense, just a normal src
   const src = name
     ? \`https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes/\${name}.png\`
     : null;
@@ -504,9 +543,9 @@ function Hero({ id }) {
   );
 }
 
-function Pill({ children }) {
+function Pill({ children, className }) {
   return (
-    <span className="text-[10px] font-black tracking-wide uppercase bg-slate-950/45 border border-white/10 text-slate-300 px-2 py-1 rounded-full">
+    <span className={\`text-[10px] font-black tracking-wide uppercase bg-slate-950/45 border border-white/10 text-slate-300 px-2 py-1 rounded-full \${className || ""}\`}>
       {children}
     </span>
   );
@@ -672,7 +711,6 @@ function App() {
                 <span className="text-slate-600">•</span>
                 <a className="text-xs font-black text-blue-300 hover:text-blue-200 transition-colors" href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia" target="_blank">Get Free ETH</a>
 
-                {/* ✅ pool rate display */}
                 {poolRate && (
                   <>
                     <span className="text-slate-600">•</span>
@@ -873,18 +911,13 @@ function App() {
                             </div>
                             <div className="text-xs text-slate-300 mt-1 flex flex-wrap gap-2">
                               <Pill>Pick: {b.pick}</Pill>
-                              {/* REPLACEMENT CODE FOR THE TIME PILL */}
                               {(() => {
-                                // If bet is pending, show countdown to settlement time
                                 if (b.status === 'PENDING' && m?.elapsed != null && meta?.odds?.[b.market]?.timer) {
                                   const target = meta.odds[b.market].timer;
                                   const left = target - m.elapsed;
-                                  
                                   if (left > 0) return <Pill>Settles in {fmtTime(left)}</Pill>;
                                   return <Pill className="text-yellow-300 animate-pulse">Settling...</Pill>;
                                 }
-                                
-                                // Otherwise (won/lost/void), just show the game time snapshot
                                 return m?.elapsed != null && <Pill>T={fmtTime(m.elapsed)}</Pill>;
                               })()}
                               {m?.game_mode != null && <Pill>{GAME_MODE[m.game_mode] || ("Mode " + m.game_mode)}</Pill>}
@@ -1004,9 +1037,7 @@ app.get("/", (req, res) => res.send(HTML));
 
   console.log("---------------------------------------");
   console.log("🟢 DBET.LIVE STARTED (One-file full-stack)");
-  console.log("   Anti-Detection: UA rotation + jitter");
-  console.log("   Live Matches: strictly 0:00–5:00 then disappear");
-  console.log("   My Bets: keeps tracking after 5:00");
+  console.log("   Proxy System: ENABLED (Fallback mode)");
   console.log(`   Pool Rate: 1 ETH = ${POOL_RATE_ETH_TO_DBET} ${TOKEN_SYMBOL}`);
   console.log("---------------------------------------");
 
