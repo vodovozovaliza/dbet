@@ -1,2 +1,20 @@
-node_modules
+# Dependencies
+node_modules/
+
+# Environment Variables (CRITICAL: Contains your private keys)
 .env
+.env.local
+
+# Database (CRITICAL: Contains user data and transaction history)
+*.db
+*.db-journal
+prisma/dev.db
+prisma/*.db
+
+# Build Output (These are generated files, don't commit them)
+dist/
+client/dist/
+build/
+
+# Mac OS junk
+.DS_Store
